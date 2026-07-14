@@ -221,9 +221,9 @@ fn macos_tray_icon() -> Option<Image<'static>> {
 }
 
 #[tauri::command]
-fn repair_linux_webview_after_focus(app: tauri::AppHandle) {
+fn repair_linux_webview_after_focus(_app: tauri::AppHandle) {
     #[cfg(target_os = "linux")]
-    if let Some(window) = app.get_webview_window("main") {
+    if let Some(window) = _app.get_webview_window("main") {
         let main_thread_window = window.clone();
         if let Err(error) = window.run_on_main_thread(move || {
             use gtk::prelude::{GtkWindowExt, WidgetExt};
