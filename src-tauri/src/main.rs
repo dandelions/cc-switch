@@ -10,13 +10,6 @@ fn main() {
         if std::env::var("WEBKIT_DISABLE_DMABUF_RENDERER").is_err() {
             std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
         }
-        // 禁用 WebKitGTK 合成模式，规避 resize 时 webview 崩溃以及部分 Wayland
-        // 合成器下的 surface 协商问题（整窗 UI 点击无响应、必须最大化-还原才能恢复）。
-        // 参考: https://github.com/tauri-apps/tauri/issues/9394
-        if std::env::var("WEBKIT_DISABLE_COMPOSITING_MODE").is_err() {
-            std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
-        }
-
         // AppImage 的 GTK 启动钩子 (linuxdeploy-plugin-gtk.sh) 会无条件
         // `export GDK_BACKEND=x11` 强制走 XWayland，以规避历史上的 Wayland 崩溃
         // (tauri-apps/tauri#8541)。但在较新的 Wayland + NVIDIA 环境下，强制 XWayland

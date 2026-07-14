@@ -170,6 +170,40 @@ function App() {
   const { t } = useTranslation();
   const queryClient = useQueryClient();
 
+  useEffect(() => {
+    if (!isLinux()) return;
+
+    let repairTimer: number | undefined;
+    const scheduleRepair = () => {
+      if (repairTimer !== undefined) window.clearTimeout(repairTimer);
+      repairTimer = window.setTimeout(() => {
+        void invoke("repair_linux_webview_after_focus");
+      }, 0);
+    };
+
+    const repairAfterEditableFocus = (event: FocusEvent) => {
+      const target = event.target;
+      if (!(target instanceof HTMLElement)) return;
+      if (
+        !target.matches(
+          'input, textarea, [contenteditable]:not([contenteditable="false"])',
+        )
+      ) {
+        return;
+      }
+
+      scheduleRepair();
+    };
+
+    document.addEventListener("click", scheduleRepair, true);
+    document.addEventListener("focusin", repairAfterEditableFocus, true);
+    return () => {
+      if (repairTimer !== undefined) window.clearTimeout(repairTimer);
+      document.removeEventListener("click", scheduleRepair, true);
+      document.removeEventListener("focusin", repairAfterEditableFocus, true);
+    };
+  }, []);
+
   const [activeApp, setActiveApp] = useState<AppId>(getInitialApp);
   const sharedFeatureApp: AppId =
     activeApp === "claude-desktop" ? "claude" : activeApp;

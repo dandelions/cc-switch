@@ -220,6 +220,43 @@ fn macos_tray_icon() -> Option<Image<'static>> {
     }
 }
 
+#[tauri::command]
+fn repair_linux_webview_after_focus(app: tauri::AppHandle) {
+    #[cfg(target_os = "linux")]
+    if let Some(window) = app.get_webview_window("main") {
+        let main_thread_window = window.clone();
+        if let Err(error) = window.run_on_main_thread(move || {
+            use gtk::prelude::{GtkWindowExt, WidgetExt};
+
+            let Ok(gtk_window) = main_thread_window.gtk_window() else {
+                return;
+            };
+            let (width, height) = gtk_window.size();
+            let Some(gdk_window) = gtk_window.window() else {
+                return;
+            };
+
+            // Resize the realized GDK/X11 toplevel directly. gtk_window_resize
+            // can be absorbed by GTK's geometry negotiation on trixie, while
+            // the outer Configure event is what wakes WebKit's stale surface.
+            gdk_window.resize(width.saturating_add(1), height);
+            gtk_window.queue_resize();
+            gtk_window.queue_draw();
+
+            webkit2gtk::glib::timeout_add_local_once(
+                std::time::Duration::from_millis(300),
+                move || {
+                    gdk_window.resize(width, height);
+                    gtk_window.queue_resize();
+                    gtk_window.queue_draw();
+                },
+            );
+        }) {
+            log::warn!("Linux interaction repair dispatch failed: {error}");
+        }
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // 设置 panic hook，在应用崩溃时记录日志到 <app_config_dir>/crash.log（默认 ~/.cc-switch/crash.log）
@@ -1138,7 +1175,9 @@ pub fn run() {
                 });
             });
 
-            // Linux: 禁用 WebKitGTK 硬件加速，防止 EGL 初始化失败导致白屏
+            // Linux: 保留 WebKitGTK 的按需合成。强制 Never 会使 Debian trixie
+            // 的 WebKitGTK 2.50+ 在页面切换或输入框聚焦后停止提交绘制帧，直到
+            // 用户手动 resize 窗口。DMA-BUF 兼容问题已在 main.rs 中单独规避。
             #[cfg(target_os = "linux")]
             {
                 if let Some(window) = app.get_webview_window("main") {
@@ -1146,8 +1185,8 @@ pub fn run() {
                         use webkit2gtk::{WebViewExt, SettingsExt, HardwareAccelerationPolicy};
                         let wk_webview = webview.inner();
                         if let Some(settings) = WebViewExt::settings(&wk_webview) {
-                            SettingsExt::set_hardware_acceleration_policy(&settings, HardwareAccelerationPolicy::Never);
-                            log::info!("已禁用 WebKitGTK 硬件加速");
+                            SettingsExt::set_hardware_acceleration_policy(&settings, HardwareAccelerationPolicy::OnDemand);
+                            log::info!("WebKitGTK 硬件加速策略：按需");
                         }
                     });
                 }
@@ -1509,6 +1548,7 @@ pub fn run() {
             commands::enter_lightweight_mode,
             commands::exit_lightweight_mode,
             commands::is_lightweight_mode,
+            repair_linux_webview_after_focus,
         ]);
 
     let app = builder
