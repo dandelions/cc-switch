@@ -220,19 +220,35 @@ fn macos_tray_icon() -> Option<Image<'static>> {
     }
 }
 
+#[cfg(target_os = "linux")]
+static LINUX_WEBVIEW_REPAIR_IN_PROGRESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 #[tauri::command]
 fn repair_linux_webview_after_focus(_app: tauri::AppHandle) {
     #[cfg(target_os = "linux")]
-    if let Some(window) = _app.get_webview_window("main") {
+    {
+        use std::sync::atomic::Ordering;
+
+        if LINUX_WEBVIEW_REPAIR_IN_PROGRESS.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
+        let Some(window) = _app.get_webview_window("main") else {
+            LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
+            return;
+        };
         let main_thread_window = window.clone();
         if let Err(error) = window.run_on_main_thread(move || {
             use gtk::prelude::{GtkWindowExt, WidgetExt};
 
             let Ok(gtk_window) = main_thread_window.gtk_window() else {
+                LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
                 return;
             };
             let (width, height) = gtk_window.size();
             let Some(gdk_window) = gtk_window.window() else {
+                LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
                 return;
             };
 
@@ -249,9 +265,11 @@ fn repair_linux_webview_after_focus(_app: tauri::AppHandle) {
                     gdk_window.resize(width, height);
                     gtk_window.queue_resize();
                     gtk_window.queue_draw();
+                    LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
                 },
             );
         }) {
+            LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
             log::warn!("Linux interaction repair dispatch failed: {error}");
         }
     }

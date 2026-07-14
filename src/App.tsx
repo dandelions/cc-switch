@@ -174,11 +174,22 @@ function App() {
     if (!isLinux()) return;
 
     let repairTimer: number | undefined;
+    let scrollRepairTimer: number | undefined;
     const scheduleRepair = () => {
       if (repairTimer !== undefined) window.clearTimeout(repairTimer);
       repairTimer = window.setTimeout(() => {
+        repairTimer = undefined;
         void invoke("repair_linux_webview_after_focus");
       }, 0);
+    };
+
+    const repairDuringScroll = () => {
+      if (scrollRepairTimer !== undefined) return;
+
+      scheduleRepair();
+      scrollRepairTimer = window.setTimeout(() => {
+        scrollRepairTimer = undefined;
+      }, 250);
     };
 
     const repairAfterEditableFocus = (event: FocusEvent) => {
@@ -197,10 +208,14 @@ function App() {
 
     document.addEventListener("click", scheduleRepair, true);
     document.addEventListener("focusin", repairAfterEditableFocus, true);
+    document.addEventListener("scroll", repairDuringScroll, true);
     return () => {
       if (repairTimer !== undefined) window.clearTimeout(repairTimer);
+      if (scrollRepairTimer !== undefined)
+        window.clearTimeout(scrollRepairTimer);
       document.removeEventListener("click", scheduleRepair, true);
       document.removeEventListener("focusin", repairAfterEditableFocus, true);
+      document.removeEventListener("scroll", repairDuringScroll, true);
     };
   }, []);
 
