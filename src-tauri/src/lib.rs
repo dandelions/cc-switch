@@ -248,22 +248,31 @@ fn repair_linux_webview_after_focus(_app: tauri::AppHandle) {
                 return;
             };
             let (width, height) = gtk_window.size();
+            let (x, y) = gtk_window.position();
+            let preserve_position = !gtk_window.is_maximized();
             let Some(gdk_window) = gtk_window.window() else {
                 LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
                 return;
             };
 
-            // Resize the realized GDK/X11 toplevel directly. gtk_window_resize
-            // can be absorbed by GTK's geometry negotiation on trixie, while
-            // the outer Configure event is what wakes WebKit's stale surface.
-            gdk_window.resize(width.saturating_add(1), height);
+            // Include the current position in the Configure request. Window
+            // managers can otherwise recenter oversized windows after resize.
+            if preserve_position {
+                gdk_window.move_resize(x, y, width.saturating_add(1), height);
+            } else {
+                gdk_window.resize(width.saturating_add(1), height);
+            }
             gtk_window.queue_resize();
             gtk_window.queue_draw();
 
             webkit2gtk::glib::timeout_add_local_once(
                 std::time::Duration::from_millis(300),
                 move || {
-                    gdk_window.resize(width, height);
+                    if preserve_position {
+                        gdk_window.move_resize(x, y, width, height);
+                    } else {
+                        gdk_window.resize(width, height);
+                    }
                     gtk_window.queue_resize();
                     gtk_window.queue_draw();
                     LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
