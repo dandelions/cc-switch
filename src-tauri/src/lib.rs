@@ -225,6 +225,87 @@ fn macos_tray_icon() -> Option<Image<'static>> {
 static LINUX_WEBVIEW_REPAIR_IN_PROGRESS: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(target_os = "linux")]
+static LINUX_WINDOW_MOVE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(target_os = "linux")]
+const WINDOW_MOVE_REPAIR_WAIT: std::time::Duration = std::time::Duration::from_millis(150);
+
+#[cfg(target_os = "linux")]
+fn window_extends_beyond_workarea(
+    window: (i32, i32, i32, i32),
+    workarea: (i32, i32, i32, i32),
+) -> bool {
+    let (window_x, window_y, window_width, window_height) = window;
+    let (workarea_x, workarea_y, workarea_width, workarea_height) = workarea;
+
+    let window_right = i64::from(window_x) + i64::from(window_width);
+    let window_bottom = i64::from(window_y) + i64::from(window_height);
+    let workarea_right = i64::from(workarea_x) + i64::from(workarea_width);
+    let workarea_bottom = i64::from(workarea_y) + i64::from(workarea_height);
+
+    window_width > workarea_width
+        || window_height > workarea_height
+        || window_x < workarea_x
+        || window_y < workarea_y
+        || window_right > workarea_right
+        || window_bottom > workarea_bottom
+}
+
+#[cfg(target_os = "linux")]
+fn repair_linux_webview_child(window: tauri::WebviewWindow) {
+    use std::sync::atomic::Ordering;
+
+    if let Err(error) = window.with_webview(|webview| {
+        use gtk::prelude::WidgetExt;
+
+        let webview = webview.inner();
+        let original = webview.allocation();
+        let bumped = gtk::Allocation::new(
+            original.x(),
+            original.y(),
+            original.width().saturating_add(1),
+            original.height(),
+        );
+        webview.size_allocate(&bumped);
+        webview.queue_draw();
+
+        webkit2gtk::glib::timeout_add_local_once(
+            std::time::Duration::from_millis(100),
+            move || {
+                webview.size_allocate(&original);
+                webview.queue_draw();
+                LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
+            },
+        );
+    }) {
+        LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
+        log::warn!("Linux WebView child repair dispatch failed: {error}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn schedule_linux_webview_repair_after_move(app: tauri::AppHandle) {
+    use std::sync::atomic::Ordering;
+
+    let generation = LINUX_WINDOW_MOVE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(WINDOW_MOVE_REPAIR_WAIT).await;
+        if LINUX_WINDOW_MOVE_GENERATION.load(Ordering::Acquire) != generation
+            || LINUX_WEBVIEW_REPAIR_IN_PROGRESS.swap(true, Ordering::AcqRel)
+        {
+            return;
+        }
+
+        let Some(window) = app.get_webview_window("main") else {
+            LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
+            return;
+        };
+        repair_linux_webview_child(window);
+    });
+}
+
 #[tauri::command]
 fn repair_linux_webview_after_focus(_app: tauri::AppHandle) {
     #[cfg(target_os = "linux")]
@@ -241,22 +322,55 @@ fn repair_linux_webview_after_focus(_app: tauri::AppHandle) {
         };
         let main_thread_window = window.clone();
         if let Err(error) = window.run_on_main_thread(move || {
-            use gtk::prelude::{GtkWindowExt, WidgetExt};
+            use gtk::{
+                gdk::prelude::MonitorExt,
+                prelude::{GtkWindowExt, WidgetExt},
+            };
 
+            let webview_window = main_thread_window.clone();
             let Ok(gtk_window) = main_thread_window.gtk_window() else {
                 LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
                 return;
             };
             let (width, height) = gtk_window.size();
-            let (x, y) = gtk_window.position();
             let preserve_position = !gtk_window.is_maximized();
             let Some(gdk_window) = gtk_window.window() else {
                 LINUX_WEBVIEW_REPAIR_IN_PROGRESS.store(false, Ordering::Release);
                 return;
             };
 
+            let (x, y) = gdk_window.root_origin();
+            let extends_beyond_workarea = gdk_window
+                .display()
+                .monitor_at_window(&gdk_window)
+                .map(|monitor| {
+                    let workarea = monitor.workarea();
+                    window_extends_beyond_workarea(
+                        (x, y, width, height),
+                        (
+                            workarea.x(),
+                            workarea.y(),
+                            workarea.width(),
+                            workarea.height(),
+                        ),
+                    )
+                })
+                .unwrap_or(false);
+
+            // Resizing an oversized or deliberately off-screen toplevel lets
+            // the window manager clamp it back into the work area. Allocate
+            // the WebKit child directly in that case: it refreshes WebKit's
+            // input surface without sending a toplevel Configure request.
+            if preserve_position && extends_beyond_workarea {
+                repair_linux_webview_child(webview_window);
+                return;
+            }
+
             // Include the current position in the Configure request. Window
             // managers can otherwise recenter oversized windows after resize.
+            // GtkWindow::position may retain the application's originally
+            // requested coordinates after the user moves the window, so read
+            // the realized GDK window's actual root coordinates instead.
             if preserve_position {
                 gdk_window.move_resize(x, y, width.saturating_add(1), height);
             } else {
@@ -269,7 +383,12 @@ fn repair_linux_webview_after_focus(_app: tauri::AppHandle) {
                 std::time::Duration::from_millis(300),
                 move || {
                     if preserve_position {
-                        gdk_window.move_resize(x, y, width, height);
+                        // The user may move the window while this delayed
+                        // restore is pending. Preserve its position at the
+                        // time of the restore instead of replaying a stale
+                        // coordinate captured before the delay.
+                        let (current_x, current_y) = gdk_window.root_origin();
+                        gdk_window.move_resize(current_x, current_y, width, height);
                     } else {
                         gdk_window.resize(width, height);
                     }
@@ -338,6 +457,11 @@ pub fn run() {
         .plugin(tauri_plugin_deep_link::init())
         // 拦截窗口关闭：根据设置决定是否最小化到托盘
         .on_window_event(|window, event| {
+            #[cfg(target_os = "linux")]
+            if matches!(event, tauri::WindowEvent::Moved(_)) && window.label() == "main" {
+                schedule_linux_webview_repair_after_move(window.app_handle().clone());
+            }
+
             if let tauri::WindowEvent::CloseRequested { api, .. } = event {
                 // 数据库版本过新的恢复模式下没有托盘可唤回，关闭即退出，避免应用隐身后台
                 let in_db_recovery = crate::init_status::get_init_error()
@@ -2135,6 +2259,27 @@ pub fn restart_process(app_handle: &tauri::AppHandle) -> ! {
 #[cfg(test)]
 mod tests {
     use super::{classify_exit_request, ExitRequestAction};
+
+    #[cfg(target_os = "linux")]
+    use super::window_extends_beyond_workarea;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn oversized_window_moved_past_left_edge_skips_toplevel_resize() {
+        assert!(window_extends_beyond_workarea(
+            (-600, 40, 2500, 900),
+            (0, 0, 1920, 1040),
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fully_visible_window_can_use_toplevel_resize_repair() {
+        assert!(!window_extends_beyond_workarea(
+            (100, 40, 1200, 900),
+            (0, 0, 1920, 1040),
+        ));
+    }
 
     #[test]
     fn no_code_keeps_app_alive_in_tray() {
