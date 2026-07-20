@@ -65,28 +65,63 @@ fn launch_linux_terminal(target: &str, command: &str, cwd: Option<&str>) -> Resu
 
     let mut last_error = format!("未找到可用的终端: {target}");
     for terminal in candidates {
-        let args: Vec<&str> = match terminal {
-            "gnome-terminal" | "mate-terminal" => vec!["--", &shell, "-lc", &shell_command],
-            "konsole" | "xfce4-terminal" | "lxterminal" => {
-                vec!["-e", &shell, "-lc", &shell_command]
-            }
-            "alacritty" | "kitty" | "ghostty" => {
-                vec!["-e", &shell, "-lc", &shell_command]
-            }
-            _ => vec!["-e", &shell, "-lc", &shell_command],
-        };
-
         if !command_exists(terminal) {
             continue;
         }
 
-        match Command::new(terminal).args(args).spawn() {
-            Ok(_) => return Ok(()),
-            Err(error) => last_error = format!("执行 {terminal} 失败: {error}"),
+        let args = linux_terminal_args(terminal, &shell, &shell_command);
+        match spawn_linux_terminal(terminal, &args) {
+            Ok(()) => return Ok(()),
+            Err(error) => last_error = error,
         }
     }
 
     Err(last_error)
+}
+
+#[cfg(target_os = "linux")]
+fn linux_terminal_args(terminal: &str, shell: &str, command: &str) -> Vec<String> {
+    let separator = match terminal {
+        "gnome-terminal" | "mate-terminal" => "--",
+        // Xfce's -e/--command consumes one command string. -x/--execute is
+        // required when the executable and its arguments are passed separately.
+        "xfce4-terminal" => "-x",
+        _ => "-e",
+    };
+
+    vec![
+        separator.to_string(),
+        shell.to_string(),
+        "-lc".to_string(),
+        command.to_string(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn spawn_linux_terminal(terminal: &str, args: &[String]) -> Result<(), String> {
+    let mut child = Command::new(terminal)
+        .args(args)
+        .spawn()
+        .map_err(|error| format!("执行 {terminal} 失败: {error}"))?;
+
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    match child.try_wait() {
+        Ok(Some(status)) if status.success() => Ok(()),
+        Ok(Some(status)) => Err(format!(
+            "执行 {terminal} 失败，退出状态: {}",
+            status.code().map_or_else(
+                || "terminated by signal".to_string(),
+                |code| code.to_string()
+            )
+        )),
+        Ok(None) => {
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+            Ok(())
+        }
+        Err(error) => Err(format!("检查 {terminal} 启动状态失败: {error}")),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -416,6 +451,24 @@ mod tests {
         assert_eq!(
             build_shell_command("claude --resume abc-123", None),
             "claude --resume abc-123"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn xfce_uses_execute_flag_for_separate_shell_arguments() {
+        assert_eq!(
+            linux_terminal_args(
+                "xfce4-terminal",
+                "/bin/bash",
+                "cd \"/tmp/project dir\" && codex resume abc-123",
+            ),
+            vec![
+                "-x",
+                "/bin/bash",
+                "-lc",
+                "cd \"/tmp/project dir\" && codex resume abc-123",
+            ]
         );
     }
 
