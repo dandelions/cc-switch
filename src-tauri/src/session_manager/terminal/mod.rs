@@ -45,6 +45,7 @@ fn launch_linux_terminal(target: &str, command: &str, cwd: Option<&str>) -> Resu
     // shell profile (for example via nvm/fnm) are available in the new terminal.
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
     let shell_command = build_shell_command(command, cwd);
+    let launcher_path = create_linux_launcher(&shell, &shell_command)?;
     let defaults = [
         "gnome-terminal",
         "konsole",
@@ -69,31 +70,72 @@ fn launch_linux_terminal(target: &str, command: &str, cwd: Option<&str>) -> Resu
             continue;
         }
 
-        let args = linux_terminal_args(terminal, &shell, &shell_command);
+        let args = linux_terminal_args(terminal, &launcher_path);
         match spawn_linux_terminal(terminal, &args) {
             Ok(()) => return Ok(()),
             Err(error) => last_error = error,
         }
     }
 
+    let _ = std::fs::remove_file(launcher_path);
     Err(last_error)
 }
 
 #[cfg(target_os = "linux")]
-fn linux_terminal_args(terminal: &str, shell: &str, command: &str) -> Vec<String> {
+fn create_linux_launcher(shell: &str, command: &str) -> Result<std::path::PathBuf, String> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut launcher = tempfile::Builder::new()
+        .prefix("cc_switch_session_")
+        .suffix(".sh")
+        .disable_cleanup(true)
+        .tempfile()
+        .map_err(|error| format!("创建会话启动脚本失败: {error}"))?;
+    let launcher_path = launcher.path().to_path_buf();
+    let script = build_linux_launcher_script(&launcher_path, shell, command);
+
+    launcher
+        .write_all(script.as_bytes())
+        .map_err(|error| format!("写入会话启动脚本失败: {error}"))?;
+    std::fs::set_permissions(&launcher_path, std::fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("设置会话启动脚本权限失败: {error}"))?;
+
+    Ok(launcher_path)
+}
+
+#[cfg(target_os = "linux")]
+fn build_linux_launcher_script(
+    launcher_path: &std::path::Path,
+    shell: &str,
+    command: &str,
+) -> String {
+    format!(
+        "#!/bin/sh\nrm -f -- {}\nexec {} -l -c {}\n",
+        posix_shell_quote(&launcher_path.to_string_lossy()),
+        posix_shell_quote(shell),
+        posix_shell_quote(command),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn posix_shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+#[cfg(target_os = "linux")]
+fn linux_terminal_args(terminal: &str, launcher_path: &std::path::Path) -> Vec<String> {
     let separator = match terminal {
         "gnome-terminal" | "mate-terminal" => "--",
-        // Xfce's -e/--command consumes one command string. -x/--execute is
-        // required when the executable and its arguments are passed separately.
+        // Xfce's -e/--command consumes a command string, while -x/--execute
+        // accepts an executable path without parsing it again.
         "xfce4-terminal" => "-x",
         _ => "-e",
     };
 
     vec![
         separator.to_string(),
-        shell.to_string(),
-        "-lc".to_string(),
-        command.to_string(),
+        launcher_path.to_string_lossy().into_owned(),
     ]
 }
 
@@ -456,19 +498,40 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn xfce_uses_execute_flag_for_separate_shell_arguments() {
+    fn linux_terminals_receive_one_launcher_executable() {
+        let launcher = std::path::Path::new("/tmp/cc switch launcher.sh");
+
         assert_eq!(
-            linux_terminal_args(
-                "xfce4-terminal",
-                "/bin/bash",
-                "cd \"/tmp/project dir\" && codex resume abc-123",
-            ),
-            vec![
-                "-x",
-                "/bin/bash",
-                "-lc",
-                "cd \"/tmp/project dir\" && codex resume abc-123",
-            ]
+            linux_terminal_args("xfce4-terminal", launcher),
+            vec!["-x", "/tmp/cc switch launcher.sh"]
+        );
+        assert_eq!(
+            linux_terminal_args("gnome-terminal", launcher),
+            vec!["--", "/tmp/cc switch launcher.sh"]
+        );
+
+        for terminal in ["konsole", "lxterminal", "alacritty", "kitty", "ghostty"] {
+            assert_eq!(
+                linux_terminal_args(terminal, launcher),
+                vec!["-e", "/tmp/cc switch launcher.sh"]
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_launcher_quotes_shell_command_and_self_removes() {
+        let script = build_linux_launcher_script(
+            std::path::Path::new("/tmp/cc switch's launcher.sh"),
+            "/bin/fish",
+            "cd '/tmp/project dir' && codex resume abc-123",
+        );
+
+        assert_eq!(
+            script,
+            "#!/bin/sh\n\
+rm -f -- '/tmp/cc switch'\"'\"'s launcher.sh'\n\
+exec '/bin/fish' -l -c 'cd '\"'\"'/tmp/project dir'\"'\"' && codex resume abc-123'\n"
         );
     }
 
