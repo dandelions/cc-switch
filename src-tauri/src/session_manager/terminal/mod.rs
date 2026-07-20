@@ -10,25 +10,98 @@ pub fn launch_terminal(
         return Err("Resume command is empty".to_string());
     }
 
-    if !cfg!(target_os = "macos") {
-        return Err("Terminal resume is only supported on macOS".to_string());
+    #[cfg(target_os = "macos")]
+    {
+        return match target {
+            "terminal" => launch_macos_terminal(command, cwd),
+            "iTerm" | "iterm" => launch_iterm(command, cwd),
+            "ghostty" => launch_ghostty(command, cwd),
+            "kitty" => launch_kitty(command, cwd),
+            "wezterm" => launch_wezterm(command, cwd),
+            "kaku" => launch_kaku(command, cwd),
+            "alacritty" => launch_alacritty(command, cwd),
+            "warp" => launch_warp(command, cwd),
+            "custom" => launch_custom(command, cwd, custom_config),
+            _ => Err(format!("Unsupported terminal target: {target}")),
+        };
     }
 
-    match target {
-        "terminal" => launch_macos_terminal(command, cwd),
-        "iTerm" | "iterm" => launch_iterm(command, cwd),
-        "ghostty" => launch_ghostty(command, cwd),
-        "kitty" => launch_kitty(command, cwd),
-        "wezterm" => launch_wezterm(command, cwd),
-        "kaku" => launch_kaku(command, cwd),
-        "alacritty" => launch_alacritty(command, cwd),
-        #[cfg(unix)]
-        "warp" => launch_warp(command, cwd),
-        "custom" => launch_custom(command, cwd, custom_config),
-        _ => Err(format!("Unsupported terminal target: {target}")),
+    #[cfg(target_os = "linux")]
+    {
+        let _ = custom_config;
+        return launch_linux_terminal(target, command, cwd);
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    {
+        let _ = (target, cwd, custom_config);
+        Err("Terminal resume is not supported on this platform".to_string())
     }
 }
 
+#[cfg(target_os = "linux")]
+fn launch_linux_terminal(target: &str, command: &str, cwd: Option<&str>) -> Result<(), String> {
+    // Keep the command in a login shell so provider CLIs installed by the user's
+    // shell profile (for example via nvm/fnm) are available in the new terminal.
+    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+    let shell_command = build_shell_command(command, cwd);
+    let defaults = [
+        "gnome-terminal",
+        "konsole",
+        "xfce4-terminal",
+        "mate-terminal",
+        "lxterminal",
+        "alacritty",
+        "kitty",
+        "ghostty",
+    ];
+    let candidates: Vec<&str> = if target == "terminal" {
+        defaults.to_vec()
+    } else {
+        let mut values = vec![target];
+        values.extend(defaults.iter().copied().filter(|name| *name != target));
+        values
+    };
+
+    let mut last_error = format!("未找到可用的终端: {target}");
+    for terminal in candidates {
+        let args: Vec<&str> = match terminal {
+            "gnome-terminal" | "mate-terminal" => vec!["--", &shell, "-lc", &shell_command],
+            "konsole" | "xfce4-terminal" | "lxterminal" => {
+                vec!["-e", &shell, "-lc", &shell_command]
+            }
+            "alacritty" | "kitty" | "ghostty" => {
+                vec!["-e", &shell, "-lc", &shell_command]
+            }
+            _ => vec!["-e", &shell, "-lc", &shell_command],
+        };
+
+        if !command_exists(terminal) {
+            continue;
+        }
+
+        match Command::new(terminal).args(args).spawn() {
+            Ok(_) => return Ok(()),
+            Err(error) => last_error = format!("执行 {terminal} 失败: {error}"),
+        }
+    }
+
+    Err(last_error)
+}
+
+#[cfg(target_os = "linux")]
+fn command_exists(command: &str) -> bool {
+    Command::new("which")
+        .arg(command)
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+        || ["/usr/bin", "/bin", "/usr/local/bin"]
+            .iter()
+            .any(|directory| std::path::Path::new(directory).join(command).exists())
+}
+
+#[cfg(target_os = "macos")]
 fn launch_macos_terminal(command: &str, cwd: Option<&str>) -> Result<(), String> {
     let full_command = build_shell_command(command, cwd);
     let escaped = escape_osascript(&full_command);
@@ -52,6 +125,7 @@ end tell"#
     }
 }
 
+#[cfg(target_os = "macos")]
 fn launch_iterm(command: &str, cwd: Option<&str>) -> Result<(), String> {
     let full_command = build_shell_command(command, cwd);
     let escaped = escape_osascript(&full_command);
@@ -79,6 +153,7 @@ end tell"#
     }
 }
 
+#[cfg(target_os = "macos")]
 fn launch_ghostty(command: &str, cwd: Option<&str>) -> Result<(), String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
 
@@ -113,6 +188,7 @@ fn launch_ghostty(command: &str, cwd: Option<&str>) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn launch_kitty(command: &str, cwd: Option<&str>) -> Result<(), String> {
     let full_command = build_shell_command(command, cwd);
 
@@ -138,6 +214,7 @@ fn launch_kitty(command: &str, cwd: Option<&str>) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn launch_wezterm(command: &str, cwd: Option<&str>) -> Result<(), String> {
     // wezterm start --cwd ... -- command
     // To invoke via `open`, we use `open -na "WezTerm" --args start ...`
@@ -155,6 +232,7 @@ fn launch_wezterm(command: &str, cwd: Option<&str>) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn launch_kaku(command: &str, cwd: Option<&str>) -> Result<(), String> {
     // Kaku is a WezTerm-derived terminal and keeps a compatible `start` entrypoint.
     let args = build_wezterm_compatible_args("Kaku", command, cwd);
@@ -171,11 +249,13 @@ fn launch_kaku(command: &str, cwd: Option<&str>) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn build_wezterm_compatible_args(app_name: &str, command: &str, cwd: Option<&str>) -> Vec<String> {
     let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".to_string());
     build_wezterm_compatible_args_with_shell(app_name, command, cwd, &shell)
 }
 
+#[cfg(target_os = "macos")]
 fn build_wezterm_compatible_args_with_shell(
     app_name: &str,
     command: &str,
@@ -203,7 +283,7 @@ fn build_wezterm_compatible_args_with_shell(
     args
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 fn launch_warp(command: &str, cwd: Option<&str>) -> Result<(), String> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
@@ -245,6 +325,7 @@ fn launch_warp(command: &str, cwd: Option<&str>) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn launch_alacritty(command: &str, cwd: Option<&str>) -> Result<(), String> {
     // Alacritty: open -na Alacritty --args --working-directory ... -e shell -c command
     let full_command = build_shell_command(command, None);
@@ -274,6 +355,7 @@ fn launch_alacritty(command: &str, cwd: Option<&str>) -> Result<(), String> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn launch_custom(
     command: &str,
     cwd: Option<&str>,
@@ -320,6 +402,7 @@ fn shell_escape(value: &str) -> String {
     format!("\"{escaped}\"")
 }
 
+#[cfg(target_os = "macos")]
 fn escape_osascript(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -336,6 +419,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn wezterm_compatible_terminals_use_start_and_cwd_arguments() {
         let args = build_wezterm_compatible_args_with_shell(
@@ -362,6 +446,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "macos")]
     #[test]
     fn ghostty_uses_working_directory_arg_for_cwd() {
         // cwd should be passed as --working-directory, not embedded in the shell command string
